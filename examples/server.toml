@@ -1,0 +1,12 @@
+# soulvpn server example
+# Generate keys: soulvpn genkey  (private on stdout, public on stderr)
+
+listen = "0.0.0.0:51820"
+private_key = "REPLACE_WITH_SERVER_PRIVATE_KEY_BASE64"
+address = "10.66.66.1/24"
+mtu = 1400
+nat = true
+
+[[peers]]
+public_key = "REPLACE_WITH_CLIENT_PUBLIC_KEY_BASE64"
+allowed_ip = "10.66.66.2"

@@ -2,8 +2,8 @@
 **/*.rs.bk
 *.priv
 *.pub
-server.toml
-client.toml
+/server.toml
+/client.toml
 .idea/
 .vscode/
 *.swp

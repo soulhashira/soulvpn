@@ -1,0 +1,9 @@
+# soulvpn client example
+
+endpoint = "YOUR.SERVER.IP:51820"
+private_key = "REPLACE_WITH_CLIENT_PRIVATE_KEY_BASE64"
+server_public_key = "REPLACE_WITH_SERVER_PUBLIC_KEY_BASE64"
+address = "10.66.66.2/24"
+mtu = 1400
+# Install 0.0.0.0/1 + 128.0.0.0/1 via the TUN so all IPv4 traffic tunnels.
+redirect_all = true
