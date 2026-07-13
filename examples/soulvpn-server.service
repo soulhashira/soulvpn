@@ -1,0 +1,22 @@
+[Unit]
+Description=soulvpn server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/soulvpn server -c /etc/soulvpn/server.toml
+Restart=on-failure
+RestartSec=2
+# AmbientCapabilities=CAP_NET_ADMIN
+# Prefer running as root for TUN + iptables, or grant CAP_NET_ADMIN + CAP_NET_RAW.
+
+# Hardening (adjust if you need more)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/soulvpn /etc/soulvpn
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,9 +1,31 @@
 # soulvpn client example
+# Generate keys:
+#   soulvpn genkey --write-dir /etc/soulvpn --name client
 
 endpoint = "YOUR.SERVER.IP:51820"
-private_key = "REPLACE_WITH_CLIENT_PRIVATE_KEY_BASE64"
-server_public_key = "REPLACE_WITH_SERVER_PUBLIC_KEY_BASE64"
+
+private_key_file = "/etc/soulvpn/client.priv"
+# private_key = "REPLACE_WITH_CLIENT_PRIVATE_KEY_BASE64"
+
+server_public_key_file = "/etc/soulvpn/server.pub"
+# server_public_key = "REPLACE_WITH_SERVER_PUBLIC_KEY_BASE64"
+
 address = "10.66.66.2/24"
 mtu = 1400
+
 # Install 0.0.0.0/1 + 128.0.0.0/1 via the TUN so all IPv4 traffic tunnels.
 redirect_all = true
+
+# Fail-closed: block clearnet egress while the tunnel is enabled.
+kill_switch = true
+
+# Blackhole IPv6 so it cannot leak outside the tunnel.
+disable_ipv6 = true
+
+# Optional: rewrite /etc/resolv.conf (restored on exit). Use a resolver reachable via the tunnel.
+# dns = ["1.1.1.1", "9.9.9.9"]
+
+# keepalive_secs = 25
+# rekey_secs = 120
+# reconnect_timeout_secs = 45
+control_mode = "0600"

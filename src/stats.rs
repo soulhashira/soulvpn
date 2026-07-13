@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -10,6 +10,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub enum Role {
     Client,
     Server,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerSnapshot {
+    pub tunnel_ip: String,
+    pub endpoint: String,
+    pub session_index: u32,
+    pub last_handshake_ago_secs: u64,
+    pub idle_secs: u64,
 }
 
 #[derive(Debug)]
@@ -26,10 +35,13 @@ pub struct RuntimeStats {
     rx_bytes: AtomicU64,
     encrypt_errors: AtomicU64,
     decrypt_errors: AtomicU64,
+    policy_drops: AtomicU64,
     handshakes_ok: AtomicU64,
     handshakes_fail: AtomicU64,
+    reconnects: AtomicU64,
     active_sessions: AtomicU64,
     last_activity_ms: AtomicU64,
+    peers: Mutex<Vec<PeerSnapshot>>,
 }
 
 impl RuntimeStats {
@@ -52,10 +64,13 @@ impl RuntimeStats {
             rx_bytes: AtomicU64::new(0),
             encrypt_errors: AtomicU64::new(0),
             decrypt_errors: AtomicU64::new(0),
+            policy_drops: AtomicU64::new(0),
             handshakes_ok: AtomicU64::new(0),
             handshakes_fail: AtomicU64::new(0),
+            reconnects: AtomicU64::new(0),
             active_sessions: AtomicU64::new(0),
             last_activity_ms: AtomicU64::new(now_ms()),
+            peers: Mutex::new(Vec::new()),
         })
     }
 
@@ -80,12 +95,21 @@ impl RuntimeStats {
         self.touch();
     }
 
+    /// Mark liveness without counting traffic (keepalives).
+    pub fn touch_activity(&self) {
+        self.touch();
+    }
+
     pub fn record_encrypt_err(&self) {
         self.encrypt_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_decrypt_err(&self) {
         self.decrypt_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_policy_drop(&self) {
+        self.policy_drops.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn record_handshake_ok(&self) {
@@ -97,8 +121,18 @@ impl RuntimeStats {
         self.handshakes_fail.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_reconnect(&self) {
+        self.reconnects.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn set_sessions(&self, n: u64) {
         self.active_sessions.store(n, Ordering::Relaxed);
+    }
+
+    pub fn set_peers(&self, peers: Vec<PeerSnapshot>) {
+        if let Ok(mut g) = self.peers.lock() {
+            *g = peers;
+        }
     }
 
     fn touch(&self) {
@@ -106,6 +140,7 @@ impl RuntimeStats {
     }
 
     pub fn snapshot(&self) -> StatusSnapshot {
+        let peers = self.peers.lock().map(|g| g.clone()).unwrap_or_default();
         StatusSnapshot {
             role: self.role,
             enabled: self.is_enabled(),
@@ -116,14 +151,17 @@ impl RuntimeStats {
             rx_bytes: self.rx_bytes.load(Ordering::Relaxed),
             encrypt_errors: self.encrypt_errors.load(Ordering::Relaxed),
             decrypt_errors: self.decrypt_errors.load(Ordering::Relaxed),
+            policy_drops: self.policy_drops.load(Ordering::Relaxed),
             handshakes_ok: self.handshakes_ok.load(Ordering::Relaxed),
             handshakes_fail: self.handshakes_fail.load(Ordering::Relaxed),
+            reconnects: self.reconnects.load(Ordering::Relaxed),
             active_sessions: self.active_sessions.load(Ordering::Relaxed),
             last_activity_ms: self.last_activity_ms.load(Ordering::Relaxed),
             endpoint: self.endpoint.clone(),
             address: self.address.clone(),
             tun_name: self.tun_name.clone(),
             pid: std::process::id(),
+            peers,
         }
     }
 }
@@ -139,20 +177,26 @@ pub struct StatusSnapshot {
     pub rx_bytes: u64,
     pub encrypt_errors: u64,
     pub decrypt_errors: u64,
+    #[serde(default)]
+    pub policy_drops: u64,
     pub handshakes_ok: u64,
     pub handshakes_fail: u64,
+    #[serde(default)]
+    pub reconnects: u64,
     pub active_sessions: u64,
     pub last_activity_ms: u64,
     pub endpoint: String,
     pub address: String,
     pub tun_name: String,
     pub pid: u32,
+    #[serde(default)]
+    pub peers: Vec<PeerSnapshot>,
 }
 
 impl StatusSnapshot {
     pub fn format_human(&self) -> String {
         let state = if self.enabled { "ON " } else { "OFF" };
-        format!(
+        let mut out = format!(
             "soulvpn {role:?}  [{state}]  pid {pid}\n\
              endpoint   {endpoint}\n\
              address    {address}\n\
@@ -161,8 +205,8 @@ impl StatusSnapshot {
              sessions   {sessions}\n\
              tx         {tx_p} pkts  {tx_b}\n\
              rx         {rx_p} pkts  {rx_b}\n\
-             handshakes ok={ok}  fail={fail}\n\
-             errors     encrypt={ee}  decrypt={de}\n\
+             handshakes ok={ok}  fail={fail}  reconnects={rc}\n\
+             errors     encrypt={ee}  decrypt={de}  policy={pd}\n\
              last act   {ago} ago",
             role = self.role,
             state = state,
@@ -178,12 +222,28 @@ impl StatusSnapshot {
             rx_b = format_bytes(self.rx_bytes),
             ok = self.handshakes_ok,
             fail = self.handshakes_fail,
+            rc = self.reconnects,
             ee = self.encrypt_errors,
             de = self.decrypt_errors,
+            pd = self.policy_drops,
             ago = format_duration(Duration::from_millis(
                 now_ms().saturating_sub(self.last_activity_ms)
             )),
-        )
+        );
+        if !self.peers.is_empty() {
+            out.push_str("\npeers:\n");
+            for p in &self.peers {
+                out.push_str(&format!(
+                    "  {tip}  via {ep}  idx={idx}  hs={hs}s ago  idle={idle}s\n",
+                    tip = p.tunnel_ip,
+                    ep = p.endpoint,
+                    idx = p.session_index,
+                    hs = p.last_handshake_ago_secs,
+                    idle = p.idle_secs,
+                ));
+            }
+        }
+        out
     }
 }
 

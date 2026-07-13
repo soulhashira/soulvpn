@@ -1,0 +1,19 @@
+[Unit]
+Description=soulvpn client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/soulvpn client -c /etc/soulvpn/client.toml
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/soulvpn /etc/soulvpn /etc/resolv.conf
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

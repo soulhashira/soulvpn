@@ -1,12 +1,25 @@
 # soulvpn server example
-# Generate keys: soulvpn genkey  (private on stdout, public on stderr)
+# Generate keys:
+#   soulvpn genkey --write-dir /etc/soulvpn --name server
+#   soulvpn genkey --write-dir /etc/soulvpn --name client
 
 listen = "0.0.0.0:51820"
-private_key = "REPLACE_WITH_SERVER_PRIVATE_KEY_BASE64"
+# Prefer key files (must be mode 0600):
+private_key_file = "/etc/soulvpn/server.priv"
+# Or inline:
+# private_key = "REPLACE_WITH_SERVER_PRIVATE_KEY_BASE64"
+
 address = "10.66.66.1/24"
 mtu = 1400
 nat = true
 
+# Control socket mode (default 0600 = owner only). Use 0660 + group for monitoring as non-root.
+control_mode = "0600"
+# handshake_rate_limit = 10
+# handshake_rate_window_secs = 10
+# session_idle_secs = 180
+
 [[peers]]
 public_key = "REPLACE_WITH_CLIENT_PUBLIC_KEY_BASE64"
+# Or: cat /etc/soulvpn/client.pub
 allowed_ip = "10.66.66.2"

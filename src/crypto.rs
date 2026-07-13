@@ -6,19 +6,21 @@
 //! Handshake:
 //!   type=1 init     → [1][payload…]
 //!   type=2 response → [2][session_index:u32 LE][payload…]
+//!
+//! Empty plaintext after decrypt is a keepalive (not written to TUN).
 
 use anyhow::{bail, Context, Result};
+use rand::RngCore;
 use snow::params::NoiseParams;
 use snow::{Builder, TransportState};
-use std::sync::atomic::{AtomicU32, Ordering};
 
 pub const NOISE_PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 pub const MAX_MESSAGE: usize = 65535;
-/// Max ciphertext room for one IP packet + Noise tag.
+/// Max plaintext room for one IP packet (ciphertext adds 16-byte tag).
 pub const MAX_PAYLOAD: usize = 65519;
-const REPLAY_WINDOW: u64 = 64;
-
-static NEXT_SESSION_INDEX: AtomicU32 = AtomicU32::new(1);
+/// Sliding replay window size (bits). Larger than classic 64 for reordering under load.
+const REPLAY_WINDOW: u64 = 1024;
+const REPLAY_WORDS: usize = (REPLAY_WINDOW as usize) / 64;
 
 fn params() -> NoiseParams {
     NOISE_PARAMS.parse().expect("static noise params")
@@ -40,11 +42,34 @@ pub fn public_from_private(private: &[u8; 32]) -> [u8; 32] {
     *public.as_bytes()
 }
 
-/// Sliding 64-bit replay window keyed on Noise nonce.
-#[derive(Debug, Default)]
+/// Allocate a random non-zero session index.
+pub fn random_session_index() -> u32 {
+    loop {
+        let mut b = [0u8; 4];
+        rand::thread_rng().fill_bytes(&mut b);
+        let v = u32::from_le_bytes(b);
+        if v != 0 {
+            return v;
+        }
+    }
+}
+
+/// Sliding multi-word replay window keyed on Noise nonce.
+#[derive(Debug, Clone)]
 pub struct ReplayWindow {
     highest: u64,
-    bitmap: u64,
+    /// Bit 0 of word 0 = `highest`; higher offsets are older nonces.
+    bitmap: [u64; REPLAY_WORDS],
+}
+
+impl Default for ReplayWindow {
+    fn default() -> Self {
+        Self {
+            highest: 0,
+            bitmap: [0; REPLAY_WORDS],
+            // Note: nonce 0 is not pre-marked; first packet with 0 is accepted.
+        }
+    }
 }
 
 impl ReplayWindow {
@@ -53,23 +78,67 @@ impl ReplayWindow {
         if nonce > self.highest {
             let shift = nonce - self.highest;
             if shift >= REPLAY_WINDOW {
-                self.bitmap = 1;
+                self.bitmap = [0; REPLAY_WORDS];
             } else {
-                self.bitmap = (self.bitmap << shift) | 1;
+                shift_left(&mut self.bitmap, shift as usize);
             }
             self.highest = nonce;
+            set_bit(&mut self.bitmap, 0);
             return true;
         }
         let offset = self.highest - nonce;
         if offset >= REPLAY_WINDOW {
             return false;
         }
-        let bit = 1u64 << offset;
-        if self.bitmap & bit != 0 {
+        let off = offset as usize;
+        if test_bit(&self.bitmap, off) {
             return false;
         }
-        self.bitmap |= bit;
+        set_bit(&mut self.bitmap, off);
         true
+    }
+}
+
+fn shift_left(bits: &mut [u64; REPLAY_WORDS], shift: usize) {
+    if shift == 0 {
+        return;
+    }
+    if shift >= REPLAY_WINDOW as usize {
+        *bits = [0; REPLAY_WORDS];
+        return;
+    }
+    let word_shift = shift / 64;
+    let bit_shift = shift % 64;
+    if word_shift > 0 {
+        for i in (0..REPLAY_WORDS).rev() {
+            let src = i as isize - word_shift as isize;
+            bits[i] = if src >= 0 { bits[src as usize] } else { 0 };
+        }
+    }
+    if bit_shift > 0 {
+        let mut carry = 0u64;
+        for w in bits.iter_mut() {
+            let new_carry = *w >> (64 - bit_shift);
+            *w = (*w << bit_shift) | carry;
+            carry = new_carry;
+        }
+    }
+}
+
+fn test_bit(bits: &[u64; REPLAY_WORDS], offset: usize) -> bool {
+    let word = offset / 64;
+    let bit = offset % 64;
+    if word >= REPLAY_WORDS {
+        return false;
+    }
+    bits[word] & (1u64 << bit) != 0
+}
+
+fn set_bit(bits: &mut [u64; REPLAY_WORDS], offset: usize) {
+    let word = offset / 64;
+    let bit = offset % 64;
+    if word < REPLAY_WORDS {
+        bits[word] |= 1u64 << bit;
     }
 }
 
@@ -192,13 +261,16 @@ impl HandshakeResponder {
     }
 
     /// Consume type-1 init, produce type-2 response, enter transport.
-    pub fn finish(mut self, msg: &[u8]) -> Result<(Session, Vec<u8>)> {
+    /// `index` must be a unique non-zero session index chosen by the server.
+    pub fn finish(mut self, msg: &[u8], index: u32) -> Result<(Session, Vec<u8>)> {
         if msg.first() != Some(&1) {
             bail!("expected handshake init (type 1)");
         }
+        if index == 0 {
+            bail!("session index must be non-zero");
+        }
         let mut buf = [0u8; MAX_MESSAGE];
         self.state.read_message(&msg[1..], &mut buf)?;
-        let index = NEXT_SESSION_INDEX.fetch_add(1, Ordering::Relaxed);
         let mut response = vec![0u8; 1 + 4 + 128];
         response[0] = 2;
         response[1..5].copy_from_slice(&index.to_le_bytes());
@@ -224,10 +296,12 @@ mod tests {
         let init_msg = buf[..n].to_vec();
 
         let resp = HandshakeResponder::new(&srv_priv).unwrap();
-        let (mut srv_sess, response) = resp.finish(&init_msg).unwrap();
+        let idx = random_session_index();
+        let (mut srv_sess, response) = resp.finish(&init_msg, idx).unwrap();
 
         let mut cli_sess = init.finish(&response).unwrap();
         assert_eq!(cli_sess.index, srv_sess.index);
+        assert_eq!(cli_sess.index, idx);
 
         let plain = b"hello over noise";
         let mut enc = [0u8; 256];
@@ -240,6 +314,11 @@ mod tests {
         let en = srv_sess.encrypt(b"pong", &mut enc).unwrap();
         let dn = cli_sess.decrypt(&enc[..en], &mut dec).unwrap();
         assert_eq!(&dec[..dn], b"pong");
+
+        // empty keepalive
+        let en = cli_sess.encrypt(&[], &mut enc).unwrap();
+        let dn = srv_sess.decrypt(&enc[..en], &mut dec).unwrap();
+        assert_eq!(dn, 0);
     }
 
     #[test]
@@ -250,8 +329,20 @@ mod tests {
         assert!(w.check_and_update(5));
         assert!(w.check_and_update(3));
         assert!(!w.check_and_update(3));
-        assert!(w.check_and_update(70)); // far ahead
-        assert!(!w.check_and_update(5)); // outside window
+        assert!(w.check_and_update(70));
+        assert!(!w.check_and_update(5)); // outside small gap? 70-5=65 < 1024, still in window but marked
+                                         // 5 was accepted earlier, still in window → reject
+        assert!(!w.check_and_update(5));
+    }
+
+    #[test]
+    fn replay_window_large_gap() {
+        let mut w = ReplayWindow::default();
+        assert!(w.check_and_update(0));
+        assert!(w.check_and_update(2000)); // far ahead clears window
+        assert!(!w.check_and_update(0));
+        assert!(w.check_and_update(1990));
+        assert!(!w.check_and_update(1990));
     }
 
     #[test]

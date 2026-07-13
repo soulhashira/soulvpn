@@ -119,26 +119,22 @@ async fn ui_loop(
                 }
                 match key.code {
                     KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('o') => {
-                        match control::request(socket, "on").await {
-                            Ok(s) => {
-                                snap = s;
-                                msg = Some("tunnel enabled".into());
-                                err = None;
-                            }
-                            Err(e) => err = Some(e.to_string()),
+                    KeyCode::Char('o') => match control::request(socket, "on").await {
+                        Ok(s) => {
+                            snap = s;
+                            msg = Some("tunnel enabled".into());
+                            err = None;
                         }
-                    }
-                    KeyCode::Char('f') => {
-                        match control::request(socket, "off").await {
-                            Ok(s) => {
-                                snap = s;
-                                msg = Some("tunnel disabled".into());
-                                err = None;
-                            }
-                            Err(e) => err = Some(e.to_string()),
+                        Err(e) => err = Some(e.to_string()),
+                    },
+                    KeyCode::Char('f') => match control::request(socket, "off").await {
+                        Ok(s) => {
+                            snap = s;
+                            msg = Some("tunnel disabled".into());
+                            err = None;
                         }
-                    }
+                        Err(e) => err = Some(e.to_string()),
+                    },
                     KeyCode::Char(' ') => {
                         let op = if snap.enabled { "off" } else { "on" };
                         match control::request(socket, op).await {
@@ -177,7 +173,7 @@ fn draw(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(8),
+            Constraint::Length(9),
             Constraint::Length(5),
             Constraint::Length(5),
             Constraint::Length(3),
@@ -228,19 +224,42 @@ fn draw(
             snap.handshakes_ok, snap.handshakes_fail
         )),
         Line::from(format!(
-            "errors     encrypt={}  decrypt={}",
-            snap.encrypt_errors, snap.decrypt_errors
+            "errors     encrypt={}  decrypt={}  policy={}",
+            snap.encrypt_errors, snap.decrypt_errors, snap.policy_drops
         )),
+        Line::from(format!("reconnects {}", snap.reconnects)),
     ])
     .block(Block::default().borders(Borders::ALL).title("session"));
     f.render_widget(info, chunks[1]);
 
-    draw_traffic(f, chunks[2], "tx ↑", snap.tx_packets, snap.tx_bytes, rates.tx_rate, &rates.tx_hist, Color::Yellow);
-    draw_traffic(f, chunks[3], "rx ↓", snap.rx_packets, snap.rx_bytes, rates.rx_rate, &rates.rx_hist, Color::Magenta);
+    draw_traffic(
+        f,
+        chunks[2],
+        "tx ↑",
+        snap.tx_packets,
+        snap.tx_bytes,
+        rates.tx_rate,
+        &rates.tx_hist,
+        Color::Yellow,
+    );
+    draw_traffic(
+        f,
+        chunks[3],
+        "rx ↓",
+        snap.rx_packets,
+        snap.rx_bytes,
+        rates.rx_rate,
+        &rates.rx_hist,
+        Color::Magenta,
+    );
 
     let max_r = rates.tx_rate.max(rates.rx_rate).max(1.0);
     let gauge = Gauge::default()
-        .block(Block::default().borders(Borders::ALL).title("link load (relative)"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("link load (relative)"),
+        )
         .gauge_style(Style::default().fg(Color::Cyan))
         .ratio(((rates.tx_rate + rates.rx_rate) / (2.0 * max_r)).clamp(0.0, 1.0))
         .label(format!(

@@ -1,9 +1,13 @@
 //! Local Unix control socket: status / on / off.
 //!
 //! Wire format: u32 LE length + JSON body.
-//! Request:  {"op":"status"|"on"|"off"|"quit"}
+//! Request:  {"op":"status"|"on"|"off"}
 //! Response: {"ok":true,"status":{…}} | {"ok":false,"error":"…"}
+//!
+//! Socket permissions default to 0600 (owner only). Override with
+//! `control_mode` in config or `SOULVPN_CONTROL_MODE` env (e.g. "0660").
 
+use crate::config::parse_mode;
 use crate::stats::{RuntimeStats, StatusSnapshot};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -41,6 +45,7 @@ pub async fn serve(
     stats: Arc<RuntimeStats>,
     on_enable: EnableHook,
     mut shutdown: watch::Receiver<bool>,
+    mode: u32,
 ) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -49,13 +54,15 @@ pub async fn serve(
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("bind control socket {}", path.display()))?;
-    // Personal box: any local user can monitor/toggle.
+
+    let mode = resolve_control_mode(mode);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("set control socket mode {:04o}", mode))?;
     }
-    info!(path = %path.display(), "control socket listening");
+    info!(path = %path.display(), mode = format_args!("{:04o}", mode), "control socket listening");
 
     loop {
         tokio::select! {
@@ -85,6 +92,16 @@ pub async fn serve(
 
     let _ = std::fs::remove_file(&path);
     Ok(())
+}
+
+fn resolve_control_mode(from_config: u32) -> u32 {
+    if let Ok(s) = std::env::var("SOULVPN_CONTROL_MODE") {
+        match parse_mode(&s) {
+            Ok(m) => return m,
+            Err(e) => warn!("SOULVPN_CONTROL_MODE invalid ({e}); using config/default"),
+        }
+    }
+    from_config
 }
 
 async fn handle_client(
@@ -137,18 +154,18 @@ async fn handle_client(
 // ── Client helpers (status / on / off CLI) ─────────────────────────────────
 
 pub async fn request(path: &Path, op: &str) -> Result<StatusSnapshot> {
-    let mut stream = UnixStream::connect(path)
-        .await
-        .with_context(|| {
-            format!(
-                "connect control socket {} (is soulvpn server/client running?)",
-                path.display()
-            )
-        })?;
+    let mut stream = UnixStream::connect(path).await.with_context(|| {
+        format!(
+            "connect control socket {} (is soulvpn server/client running as the same user?)",
+            path.display()
+        )
+    })?;
     write_msg(&mut stream, &serde_json::json!({ "op": op })).await?;
     let resp: Response = read_msg(&mut stream).await?;
     if !resp.ok {
-        bail!(resp.error.unwrap_or_else(|| "control request failed".into()));
+        bail!(resp
+            .error
+            .unwrap_or_else(|| "control request failed".into()));
     }
     resp.status
         .context("control response missing status payload")
@@ -208,7 +225,9 @@ mod tests {
         let serve_stats = Arc::clone(&stats);
         let serve_path = sock.clone();
         let handle = tokio::spawn(async move {
-            serve(serve_path, serve_stats, on_enable, rx).await.unwrap();
+            serve(serve_path, serve_stats, on_enable, rx, 0o600)
+                .await
+                .unwrap();
         });
 
         for _ in 0..50 {
@@ -218,6 +237,13 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(sock.exists(), "control socket did not appear");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "control socket must be owner-only by default");
+        }
 
         let snap = request(&sock, "status").await.unwrap();
         assert!(snap.enabled);

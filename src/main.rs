@@ -3,14 +3,15 @@ mod config;
 mod control;
 mod crypto;
 mod monitor;
+mod packet;
 mod route;
 mod server;
 mod stats;
 mod tun_dev;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand};
-use config::{encode_key, ClientConfig, ServerConfig};
+use config::{encode_key, write_keypair_files, ClientConfig, ServerConfig};
 use crypto::{generate_keypair, public_from_private};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -28,8 +29,18 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Generate a new X25519 keypair (prints base64 private + public).
-    Genkey,
+    /// Generate a new X25519 keypair.
+    ///
+    /// Default: private key on stdout, public key on stderr (script-friendly).
+    /// Use --write-dir to write `NAME.priv` (0600) + `NAME.pub` instead.
+    Genkey {
+        /// Write key files into this directory instead of printing.
+        #[arg(long)]
+        write_dir: Option<PathBuf>,
+        /// Basename for key files (default: "key" → key.priv / key.pub).
+        #[arg(long, default_value = "key")]
+        name: String,
+    },
     /// Derive the public key from a base64 private key (stdin or arg).
     Pubkey {
         /// Base64 private key. If omitted, read one line from stdin.
@@ -64,7 +75,10 @@ enum Command {
         #[arg(long, default_value = control::DEFAULT_CONTROL_SOCKET)]
         control_socket: PathBuf,
     },
-    /// Disable the data plane (remove full-tunnel routes on the client; process stays up).
+    /// Disable the data plane (remove full-tunnel routes; process stays up).
+    ///
+    /// Warning: without kill_switch this restores clearnet. With kill_switch,
+    /// `off` also removes the kill switch so clearnet works again (explicit opt-out).
     Off {
         #[arg(long, default_value = control::DEFAULT_CONTROL_SOCKET)]
         control_socket: PathBuf,
@@ -85,7 +99,9 @@ async fn main() -> Result<()> {
         Command::Status { .. }
         | Command::On { .. }
         | Command::Off { .. }
-        | Command::Monitor { .. } => "warn",
+        | Command::Monitor { .. }
+        | Command::Genkey { .. }
+        | Command::Pubkey { .. } => "warn",
         _ => "info",
     };
     tracing_subscriber::fmt()
@@ -95,10 +111,22 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.cmd {
-        Command::Genkey => {
+        Command::Genkey { write_dir, name } => {
             let (privk, pubk) = generate_keypair()?;
-            println!("{}", encode_key(&privk));
-            eprintln!("{}", encode_key(&pubk));
+            if let Some(dir) = write_dir {
+                if name.contains('/') || name.contains("..") {
+                    bail!("invalid key name");
+                }
+                let (priv_path, pub_path) = write_keypair_files(&dir, &name, &privk, &pubk)?;
+                eprintln!("wrote {} (mode 0600)", priv_path.display());
+                eprintln!("wrote {}", pub_path.display());
+                println!("{}", priv_path.display());
+            } else {
+                // Script-friendly: private on stdout, public on stderr.
+                // Script-friendly: private on stdout, public on stderr (raw base64).
+                println!("{}", encode_key(&privk));
+                eprintln!("{}", encode_key(&pubk));
+            }
         }
         Command::Pubkey { private_key } => {
             let key = match private_key {
