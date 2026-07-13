@@ -1,8 +1,11 @@
 mod client;
 mod config;
+mod control;
 mod crypto;
+mod monitor;
 mod route;
 mod server;
+mod stats;
 mod tun_dev;
 
 use anyhow::Result;
@@ -36,23 +39,61 @@ enum Command {
     Server {
         #[arg(short, long)]
         config: PathBuf,
+        /// Unix control socket for status/on/off/monitor.
+        #[arg(long, default_value = control::DEFAULT_CONTROL_SOCKET)]
+        control_socket: PathBuf,
     },
     /// Run the VPN client (requires root / CAP_NET_ADMIN).
     Client {
         #[arg(short, long)]
         config: PathBuf,
+        /// Unix control socket for status/on/off/monitor.
+        #[arg(long, default_value = control::DEFAULT_CONTROL_SOCKET)]
+        control_socket: PathBuf,
+    },
+    /// Print one-shot status from the running daemon.
+    Status {
+        #[arg(long, default_value = control::DEFAULT_CONTROL_SOCKET)]
+        control_socket: PathBuf,
+        /// Emit JSON instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable the data plane (reinstall full-tunnel routes on the client).
+    On {
+        #[arg(long, default_value = control::DEFAULT_CONTROL_SOCKET)]
+        control_socket: PathBuf,
+    },
+    /// Disable the data plane (remove full-tunnel routes on the client; process stays up).
+    Off {
+        #[arg(long, default_value = control::DEFAULT_CONTROL_SOCKET)]
+        control_socket: PathBuf,
+    },
+    /// Live terminal dashboard (activity + on/off).
+    Monitor {
+        #[arg(long, default_value = control::DEFAULT_CONTROL_SOCKET)]
+        control_socket: PathBuf,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    // Control-plane commands stay quiet unless RUST_LOG is set.
+    let default_filter = match &cli.cmd {
+        Command::Status { .. }
+        | Command::On { .. }
+        | Command::Off { .. }
+        | Command::Monitor { .. } => "warn",
+        _ => "info",
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
         .init();
 
-    let cli = Cli::parse();
     match cli.cmd {
         Command::Genkey => {
             let (privk, pubk) = generate_keypair()?;
@@ -71,13 +112,51 @@ async fn main() -> Result<()> {
             let privk = config::decode_key(&key)?;
             println!("{}", encode_key(&public_from_private(&privk)));
         }
-        Command::Server { config } => {
+        Command::Server {
+            config,
+            control_socket,
+        } => {
             let cfg = ServerConfig::load(&config)?;
-            server::run(cfg).await?;
+            server::run(cfg, control_socket).await?;
         }
-        Command::Client { config } => {
+        Command::Client {
+            config,
+            control_socket,
+        } => {
             let cfg = ClientConfig::load(&config)?;
-            client::run(cfg).await?;
+            client::run(cfg, control_socket).await?;
+        }
+        Command::Status {
+            control_socket,
+            json,
+        } => {
+            let snap = control::request(&control_socket, "status").await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&snap)?);
+            } else {
+                println!("{}", snap.format_human());
+            }
+        }
+        Command::On { control_socket } => {
+            let snap = control::request(&control_socket, "on").await?;
+            println!(
+                "enabled  [{}]  tx={} rx={}",
+                if snap.enabled { "ON" } else { "OFF" },
+                snap.tx_packets,
+                snap.rx_packets
+            );
+        }
+        Command::Off { control_socket } => {
+            let snap = control::request(&control_socket, "off").await?;
+            println!(
+                "disabled  [{}]  tx={} rx={}",
+                if snap.enabled { "ON" } else { "OFF" },
+                snap.tx_packets,
+                snap.rx_packets
+            );
+        }
+        Command::Monitor { control_socket } => {
+            monitor::run(&control_socket).await?;
         }
     }
     Ok(())

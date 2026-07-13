@@ -1,18 +1,20 @@
 use crate::config::{decode_key, parse_cidr, ClientConfig};
+use crate::control::{self, EnableHook};
 use crate::crypto::{HandshakeInitiator, Session, MAX_MESSAGE};
 use crate::route::ClientRoutes;
+use crate::stats::{Role, RuntimeStats};
 use crate::tun_dev;
 use anyhow::{bail, Context, Result};
-use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tokio::time::{timeout, Duration};
 use tracing::{error, info, warn};
 use tun::AbstractDevice;
 
-pub async fn run(cfg: ClientConfig) -> Result<()> {
+pub async fn run(cfg: ClientConfig, control_socket: PathBuf) -> Result<()> {
     let private = decode_key(&cfg.private_key)?;
     let server_pub = decode_key(&cfg.server_public_key)?;
     let (addr, prefix) = parse_cidr(&cfg.address)?;
@@ -33,14 +35,58 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
     let tun_name = tun.tun_name().unwrap_or_else(|_| "soulvpn".into());
     info!(%tun_name, %addr, prefix, "TUN up");
 
-    // Install full-tunnel routes; Drop tears them down on exit.
-    let _routes = ClientRoutes::install(cfg.endpoint, &tun_name, cfg.redirect_all)?;
+    let routes = ClientRoutes::install(cfg.endpoint, &tun_name, cfg.redirect_all)?;
+    let routes = Arc::new(Mutex::new(routes));
+
+    let stats = RuntimeStats::new(
+        Role::Client,
+        cfg.endpoint.to_string(),
+        cfg.address.clone(),
+        tun_name.clone(),
+    );
+    stats.record_handshake_ok();
+    stats.set_sessions(1);
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    // Toggle full-tunnel routes when the control plane flips enable.
+    let routes_hook = Arc::clone(&routes);
+    let stats_hook = Arc::clone(&stats);
+    let on_enable: EnableHook = Arc::new(move |on| {
+        let routes = Arc::clone(&routes_hook);
+        let stats = Arc::clone(&stats_hook);
+        // Route ops are sync + short; run on a blocking thread so we don't stall the runtime.
+        std::thread::spawn(move || {
+            let mut g = routes.blocking_lock();
+            if on {
+                if let Err(e) = g.reenable() {
+                    warn!("re-enable routes: {e}");
+                } else {
+                    info!("tunnel enabled");
+                }
+            } else {
+                g.teardown();
+                info!("tunnel disabled (routes removed, process stays up)");
+            }
+            // Keep stats flag in sync if hook is ever called outside control.rs
+            stats.set_enabled(on);
+        });
+    });
+
+    let control_stats = Arc::clone(&stats);
+    let control_task = tokio::spawn(async move {
+        if let Err(e) = control::serve(control_socket, control_stats, on_enable, shutdown_rx).await
+        {
+            warn!("control socket: {e}");
+        }
+    });
 
     let (mut tun_r, mut tun_w) = tokio::io::split(tun);
     let sock = Arc::new(sock);
 
     let sess_up = Arc::clone(&session);
     let sock_up = Arc::clone(&sock);
+    let stats_up = Arc::clone(&stats);
     let uplink = tokio::spawn(async move {
         let mut plain = vec![0u8; MAX_MESSAGE];
         let mut wire = vec![0u8; MAX_MESSAGE];
@@ -53,16 +99,23 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
                     break;
                 }
             };
+            if !stats_up.is_enabled() {
+                continue;
+            }
             let mut guard = sess_up.lock().await;
             match guard.encrypt(&plain[..n], &mut wire) {
                 Ok(len) => {
                     drop(guard);
-                    if let Err(e) = sock_up.send(&wire[..len]).await {
-                        error!("UDP send: {e}");
-                        break;
+                    match sock_up.send(&wire[..len]).await {
+                        Ok(_) => stats_up.record_tx(n as u64),
+                        Err(e) => {
+                            error!("UDP send: {e}");
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
+                    stats_up.record_encrypt_err();
                     warn!("encrypt: {e}");
                 }
             }
@@ -71,6 +124,7 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
 
     let sess_dn = Arc::clone(&session);
     let sock_dn = Arc::clone(&sock);
+    let stats_dn = Arc::clone(&stats);
     let downlink = tokio::spawn(async move {
         let mut wire = vec![0u8; MAX_MESSAGE];
         let mut plain = vec![0u8; MAX_MESSAGE];
@@ -82,16 +136,23 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
                     break;
                 }
             };
+            if !stats_dn.is_enabled() {
+                continue;
+            }
             let mut guard = sess_dn.lock().await;
             match guard.decrypt(&wire[..n], &mut plain) {
                 Ok(len) => {
                     drop(guard);
-                    if let Err(e) = tun_w.write_all(&plain[..len]).await {
-                        error!("TUN write: {e}");
-                        break;
+                    match tun_w.write_all(&plain[..len]).await {
+                        Ok(()) => stats_dn.record_rx(len as u64),
+                        Err(e) => {
+                            error!("TUN write: {e}");
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
+                    stats_dn.record_decrypt_err();
                     warn!("decrypt: {e}");
                 }
             }
@@ -106,10 +167,18 @@ pub async fn run(cfg: ClientConfig) -> Result<()> {
         }
     }
 
+    let _ = shutdown_tx.send(true);
+    let _ = control_task.await;
+    // Drop routes → full teardown including host route.
+    drop(routes);
     Ok(())
 }
 
-async fn handshake(sock: &UdpSocket, private: &[u8; 32], server_pub: &[u8; 32]) -> Result<Session> {
+async fn handshake(
+    sock: &UdpSocket,
+    private: &[u8; 32],
+    server_pub: &[u8; 32],
+) -> Result<Session> {
     const ATTEMPTS: u32 = 10;
     const WAIT: Duration = Duration::from_secs(2);
 
@@ -133,13 +202,4 @@ async fn handshake(sock: &UdpSocket, private: &[u8; 32], server_pub: &[u8; 32]) 
         }
     }
     bail!("handshake failed after {ATTEMPTS} attempts")
-}
-
-/// Resolve peer endpoint; kept for future multi-endpoint support.
-#[allow(dead_code)]
-fn endpoint_ip(endpoint: SocketAddr) -> Option<std::net::Ipv4Addr> {
-    match endpoint {
-        SocketAddr::V4(a) => Some(*a.ip()),
-        SocketAddr::V6(_) => None,
-    }
 }

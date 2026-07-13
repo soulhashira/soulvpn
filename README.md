@@ -23,7 +23,8 @@ tunnel.
 - Session index for multi-client + client roaming
 - Full-tunnel client routes (`0.0.0.0/1` + `128.0.0.0/1`)
 - Optional server-side NAT (`iptables` MASQUERADE + `ip_forward`)
-- CLI: `genkey`, `pubkey`, `server`, `client`
+- Control plane: `status` / `on` / `off` / live `monitor` TUI
+- CLI: `genkey`, `pubkey`, `server`, `client`, `status`, `on`, `off`, `monitor`
 
 ## Requirements
 
@@ -100,6 +101,31 @@ With `redirect_all = true` the client:
 
 With `nat = true` the server enables `ip_forward` and adds
 `iptables -t nat -A POSTROUTING -s <tunnel-subnet> -o <egress> -j MASQUERADE`.
+
+## Control plane & monitor
+
+While `server` / `client` is running it listens on a Unix socket
+(default `/run/soulvpn/control.sock`, override with `--control-socket` or
+`SOULVPN_CONTROL_SOCKET`). Mode is world-accessible (`0666`) so a normal user
+can monitor a root-owned daemon.
+
+```bash
+# one-shot
+soulvpn status
+soulvpn status --json
+soulvpn off          # stop tunneling (client drops full-tunnel routes)
+soulvpn on           # resume tunneling
+
+# live TUI — rates, counters, sparkline; keys: space toggle · o on · f off · q quit
+soulvpn monitor
+```
+
+| Op | Client effect | Server effect |
+|----|---------------|---------------|
+| `off` | remove `0.0.0.0/1` + `128.0.0.0/1`; drop data-plane packets | drop data-plane packets (handshakes still accepted) |
+| `on`  | reinstall full-tunnel routes; resume encrypt/decrypt | resume encrypt/decrypt |
+
+Process stays up either way — only the data plane is gated.
 
 ## DNS
 

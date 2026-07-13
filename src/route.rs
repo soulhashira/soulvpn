@@ -62,14 +62,36 @@ impl ClientRoutes {
 
         Ok(state)
     }
-    pub fn teardown(&self) {
+    pub fn teardown(&mut self) {
+        if self.redirect_all {
+            let _ = run(&["ip", "route", "del", "0.0.0.0/1", "dev", &self.tun_name]);
+            let _ = run(&["ip", "route", "del", "128.0.0.0/1", "dev", &self.tun_name]);
+            // Keep host route while process lives so re-enable can re-add tunnel routes.
+            // Only drop host route on full drop (process exit) via take().
+        }
+        info!("full-tunnel routes removed (host route kept)");
+    }
+
+    /// Re-install full-tunnel split defaults (host route must already exist).
+    pub fn reenable(&mut self) -> Result<()> {
+        if self.redirect_all {
+            run(&["ip", "route", "replace", "0.0.0.0/1", "dev", &self.tun_name])?;
+            run(&["ip", "route", "replace", "128.0.0.0/1", "dev", &self.tun_name])?;
+            info!("full-tunnel routes reinstalled via {}", self.tun_name);
+        }
+        Ok(())
+    }
+
+    fn teardown_all(&mut self) {
         if self.redirect_all {
             let _ = run(&["ip", "route", "del", "0.0.0.0/1", "dev", &self.tun_name]);
             let _ = run(&["ip", "route", "del", "128.0.0.0/1", "dev", &self.tun_name]);
         }
-        if let (Some(host), Some(gw), Some(dev)) =
-            (self.server_host, self.via_gateway, self.via_dev.as_deref())
-        {
+        if let (Some(host), Some(gw), Some(dev)) = (
+            self.server_host.take(),
+            self.via_gateway.take(),
+            self.via_dev.take(),
+        ) {
             let _ = run(&[
                 "ip",
                 "route",
@@ -78,16 +100,16 @@ impl ClientRoutes {
                 "via",
                 &gw.to_string(),
                 "dev",
-                dev,
+                &dev,
             ]);
         }
-        info!("client routes torn down");
+        info!("client routes fully torn down");
     }
 }
 
 impl Drop for ClientRoutes {
     fn drop(&mut self) {
-        self.teardown();
+        self.teardown_all();
     }
 }
 

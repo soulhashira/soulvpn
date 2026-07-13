@@ -1,14 +1,17 @@
 use crate::config::{decode_key, parse_cidr, parse_ipv4, ServerConfig};
+use crate::control::{self, EnableHook};
 use crate::crypto::{HandshakeResponder, Session, MAX_MESSAGE};
 use crate::route;
+use crate::stats::{Role, RuntimeStats};
 use crate::tun_dev;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::net::{Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tracing::{error, info, warn};
 use tun::AbstractDevice;
 
@@ -25,15 +28,12 @@ struct LiveSession {
 }
 
 struct State {
-    /// session_index → live session
     by_index: HashMap<u32, LiveSession>,
-    /// tunnel_ip → session_index
     by_ip: HashMap<Ipv4Addr, u32>,
-    /// public_key → peer meta (from config)
     peers: HashMap<[u8; 32], PeerMeta>,
 }
 
-pub async fn run(cfg: ServerConfig) -> Result<()> {
+pub async fn run(cfg: ServerConfig, control_socket: PathBuf) -> Result<()> {
     let private = decode_key(&cfg.private_key)?;
     let (addr, prefix) = parse_cidr(&cfg.address)?;
 
@@ -68,11 +68,33 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     info!(%tun_name, %addr, prefix, "TUN up");
 
     if cfg.nat {
-        // Subnet for MASQUERADE, e.g. 10.66.66.0/24
         let network = ipv4_network(addr, prefix);
         let cidr = format!("{network}/{prefix}");
         route::setup_nat(&cidr)?;
     }
+
+    let stats = RuntimeStats::new(
+        Role::Server,
+        cfg.listen.to_string(),
+        cfg.address.clone(),
+        tun_name.clone(),
+    );
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let on_enable: EnableHook = Arc::new(|on| {
+        if on {
+            info!("data plane enabled");
+        } else {
+            info!("data plane disabled (handshakes still accepted)");
+        }
+    });
+    let control_stats = Arc::clone(&stats);
+    let control_task = tokio::spawn(async move {
+        if let Err(e) = control::serve(control_socket, control_stats, on_enable, shutdown_rx).await
+        {
+            warn!("control socket: {e}");
+        }
+    });
 
     let (mut tun_r, mut tun_w) = tokio::io::split(tun);
 
@@ -80,6 +102,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     let state_in = Arc::clone(&state);
     let sock_in = Arc::clone(&sock);
     let private_in = private;
+    let stats_in = Arc::clone(&stats);
     let downlink = tokio::spawn(async move {
         let mut buf = vec![0u8; MAX_MESSAGE];
         let mut plain = vec![0u8; MAX_MESSAGE];
@@ -95,21 +118,25 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
                 continue;
             }
             match buf[0] {
-                1 => {
-                    // Handshake init
-                    match handle_handshake(&private_in, &buf[..n], src, &state_in).await {
-                        Ok(response) => {
-                            if let Err(e) = sock_in.send_to(&response, src).await {
-                                warn!("send handshake response: {e}");
-                            } else {
-                                info!(%src, "handshake accepted");
-                            }
+                1 => match handle_handshake(&private_in, &buf[..n], src, &state_in, &stats_in)
+                    .await
+                {
+                    Ok(response) => {
+                        if let Err(e) = sock_in.send_to(&response, src).await {
+                            warn!("send handshake response: {e}");
+                        } else {
+                            info!(%src, "handshake accepted");
                         }
-                        Err(e) => warn!(%src, "handshake rejected: {e}"),
                     }
-                }
+                    Err(e) => {
+                        stats_in.record_handshake_fail();
+                        warn!(%src, "handshake rejected: {e}");
+                    }
+                },
                 _ => {
-                    // Data: first 4 bytes are session index
+                    if !stats_in.is_enabled() {
+                        continue;
+                    }
                     if n < 12 {
                         continue;
                     }
@@ -119,17 +146,22 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
                         warn!(index, %src, "unknown session");
                         continue;
                     };
-                    // Roaming: update peer addr
                     live.peer_addr = src;
                     match live.session.decrypt(&buf[..n], &mut plain) {
                         Ok(len) => {
                             drop(guard);
-                            if let Err(e) = tun_w.write_all(&plain[..len]).await {
-                                error!("TUN write: {e}");
-                                break;
+                            match tun_w.write_all(&plain[..len]).await {
+                                Ok(()) => stats_in.record_rx(len as u64),
+                                Err(e) => {
+                                    error!("TUN write: {e}");
+                                    break;
+                                }
                             }
                         }
-                        Err(e) => warn!(index, "decrypt: {e}"),
+                        Err(e) => {
+                            stats_in.record_decrypt_err();
+                            warn!(index, "decrypt: {e}");
+                        }
                     }
                 }
             }
@@ -139,6 +171,7 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
     // TUN → UDP
     let state_out = Arc::clone(&state);
     let sock_out = Arc::clone(&sock);
+    let stats_out = Arc::clone(&stats);
     let uplink = tokio::spawn(async move {
         let mut plain = vec![0u8; MAX_MESSAGE];
         let mut wire = vec![0u8; MAX_MESSAGE];
@@ -151,12 +184,14 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
                     break;
                 }
             };
+            if !stats_out.is_enabled() {
+                continue;
+            }
             let Some(dst) = ipv4_dst(&plain[..n]) else {
                 continue;
             };
             let mut guard = state_out.lock().await;
             let Some(&index) = guard.by_ip.get(&dst) else {
-                // Not a known peer; drop (or could be broadcast — ignore).
                 continue;
             };
             let Some(live) = guard.by_index.get_mut(&index) else {
@@ -166,11 +201,15 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
             match live.session.encrypt(&plain[..n], &mut wire) {
                 Ok(len) => {
                     drop(guard);
-                    if let Err(e) = sock_out.send_to(&wire[..len], peer).await {
-                        warn!(%peer, "UDP send: {e}");
+                    match sock_out.send_to(&wire[..len], peer).await {
+                        Ok(_) => stats_out.record_tx(n as u64),
+                        Err(e) => warn!(%peer, "UDP send: {e}"),
                     }
                 }
-                Err(e) => warn!("encrypt: {e}"),
+                Err(e) => {
+                    stats_out.record_encrypt_err();
+                    warn!("encrypt: {e}");
+                }
             }
         }
     });
@@ -183,6 +222,8 @@ pub async fn run(cfg: ServerConfig) -> Result<()> {
         }
     }
 
+    let _ = shutdown_tx.send(true);
+    let _ = control_task.await;
     Ok(())
 }
 
@@ -191,6 +232,7 @@ async fn handle_handshake(
     msg: &[u8],
     src: SocketAddr,
     state: &Arc<Mutex<State>>,
+    stats: &RuntimeStats,
 ) -> Result<Vec<u8>> {
     let responder = HandshakeResponder::new(private)?;
     let (session, response) = responder.finish(msg)?;
@@ -205,7 +247,6 @@ async fn handle_handshake(
         .with_context(|| format!("unknown peer public key from {src}"))?
         .clone_meta();
 
-    // Drop any previous session for this tunnel IP.
     if let Some(old_idx) = guard.by_ip.remove(&meta.tunnel_ip) {
         guard.by_index.remove(&old_idx);
     }
@@ -220,6 +261,10 @@ async fn handle_handshake(
             tunnel_ip: meta.tunnel_ip,
         },
     );
+    let sessions = guard.by_index.len() as u64;
+    drop(guard);
+    stats.set_sessions(sessions);
+    stats.record_handshake_ok();
     info!(%src, peer = %meta.tunnel_ip, index, "session established");
     Ok(response)
 }
@@ -234,16 +279,17 @@ impl PeerMeta {
 }
 
 fn ipv4_dst(packet: &[u8]) -> Option<Ipv4Addr> {
-    // Need at least IPv4 header with dest.
     if packet.len() < 20 {
         return None;
     }
-    // Version nibble
     if packet[0] >> 4 != 4 {
         return None;
     }
     Some(Ipv4Addr::new(
-        packet[16], packet[17], packet[18], packet[19],
+        packet[16],
+        packet[17],
+        packet[18],
+        packet[19],
     ))
 }
 
